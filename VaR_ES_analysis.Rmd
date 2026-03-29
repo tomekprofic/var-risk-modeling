@@ -1,0 +1,989 @@
+---
+title: "Analiza ryzyka rynkowego indeksu S&P 500: Implementacja i walidacja modeli VaR oraz ES."
+author: "Tomasz Profic"
+output: 
+  html_document: 
+    fig_width: 9
+    fig_height: 6
+    code_folding: hide
+    theme: united
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+
+# Wstęp
+
+Celem niniejszego projektu jest implementacja oraz rygorystyczna walidacja modeli zarządzania ryzykiem rynkowym. Analiza obejmuje estymację miar **Value at Risk (VaR)** oraz **Expected Shortfall (ES)** dla szerokiego rynku akcji (S&P 500) oraz zdywersyfikowanego portfela indeksów globalnych (DAX, Nikkei, S&P 500). W badaniu wykorzystano zaawansowane metody ilościowe, takie jak Symulacja Historyczna oraz modele EWMA z rozkładem empirycznym, a ich skuteczność zweryfikowano za pomocą testów statystycznych zgodnych z wytycznymi Bazylejskiego Komitetu Nadzoru Bankowego
+
+**Wczytanie bibliotek**
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(scales)
+```
+
+**Wczytanie danych**
+
+```{r}
+df <- read_csv("^spx_d.csv",show_col_types = FALSE)
+df$Data <- as.Date(df$Data)
+df <- df %>% arrange(Data)
+df$Zwrot <- c(NA, diff(log(df$Zamkniecie)))
+df_clean <- df %>% filter(!is.na(Zwrot))
+```
+
+## Metoda Historyczna
+
+W estymacji metodą historyczną zastosowano podejście oparte na bezpośredniej analizie szeregu strat (non-parametric approach). Zrezygnowano ze standardowych estymatorów kwantylowych na rzecz precyzyjnego wyznaczania wartości z ogona rozkładu empirycznego, co pozwala na uniknięcie błędów interpolacji przy rzadkich zdarzeniach rynkowych. Obliczenia Expected Shortfall uwzględniają ułamkowe udziały obserwacji granicznych, co zapewnia pełną spójność matematyczną miary
+
+**Funckja pomocnicza do liczenia VaR oraz ES dla pojedynczego dnia**
+
+```{r}
+oblicz_pojedynczy_dzien <- function(wektor_danych, alfa = 0.99) {
+  
+  posortowane <- sort(wektor_danych)
+  n_ogona <- length(wektor_danych) * (1 - alfa)
+  
+  idx_var <- ceiling(n_ogona)
+  var_val <- -posortowane[idx_var]
+  
+  k <- floor(n_ogona)      
+  reszta <- n_ogona - k    
+  
+  suma_strat <- sum(posortowane[1:k])
+  if (k < length(posortowane)) { 
+     suma_strat <- suma_strat + (reszta * posortowane[k+1])
+  }
+  
+  es_val <- -(suma_strat / n_ogona)
+  
+  return(c("VaR" = var_val, "ES" = es_val))
+}
+```
+
+**Logika obliczeniowa**
+
+```{r}
+oblicz_hist_reczna <- function(zwroty, okno = 250) {
+  n <- length(zwroty)
+  wynik_var <- rep(NA, n)
+  wynik_es  <- rep(NA, n)
+  
+  for(t in (okno + 1):n) {
+    historia <- zwroty[(t-okno):(t-1)]
+    
+    wynik <- oblicz_pojedynczy_dzien(historia)
+    
+    wynik_var[t] <- wynik["VaR"]
+    wynik_es[t]  <- wynik["ES"]
+  }
+  return(data.frame(VaR_New = wynik_var, ES_New = wynik_es))
+}
+```
+
+**Uruchomienie**
+
+```{r message=FALSE, warning=FALSE}
+wyniki_nowe  <- oblicz_hist_reczna(df_clean$Zwrot)
+
+df_clean$VaR_New_Hist <- wyniki_nowe$VaR_New
+df_clean$ES_New_Hist  <- wyniki_nowe$ES_New
+
+
+ggplot(df_clean, aes(x = Data)) +
+  geom_line(aes(y = Zwrot), color = "gray", alpha = 0.5) +
+  geom_line(aes(y = -VaR_New_Hist, color = "VaR")) +
+  labs(title = "Symulacja Historyczna ",
+       y = "-VaR/Zwrot") +
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  theme_minimal()
+
+
+ggplot(df_clean, aes(x = Data)) +
+  geom_line(aes(y = Zwrot), color = "gray", alpha = 0.5) +
+  geom_line(aes(y = -ES_New_Hist, color = "ES")) +
+  labs(title = "Symulacja Historyczna ",
+       y = "-ES/Zwrot") +
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  theme_minimal()
+```
+
+## Metoda EWMA
+
+Model EWMA (Exponentially Weighted Moving Average) został zaimplementowany w wariancie hybrydowym. Łączy on dynamiczną estymację wariancji (uwzględniającą grupowanie zmienności) z empirycznym rozkładem stóp zwrotu. Dzięki standaryzacji historycznych obserwacji względem bieżącej zmienności, model skutecznie adaptuje się do nagłych wstrząsów rynkowych, zachowując przy tym informację o grubych ogonach rozkładu (leptokurtozie), co jest kluczowe w okresach kryzysowych
+
+Jest to metoda uwzględniająca zjawisko heteroskedastyczności. Wariancja opisana jest wzorem: $\sigma_t^2 = \lambda \sigma_{t-1}^2 + (1-\lambda) r_{t-1}^2$
+
+Model bazuje na rzeczywistych danych, które są standaryzowane według wzoru zawartego w materiałach: $$\text{Scenariusz}_i = \text{Strata}_i \cdot \frac{\sigma_{n+1}}{\sigma_i}$$
+
+**Logika obliczeniowa**
+
+```{r}
+oblicz_ewma_nowa <- function(zwroty, lambda = 0.94, okno = 250, alfa = 0.99) {
+  
+  n <- length(zwroty)
+  wynik_var <- rep(NA, n)
+  wynik_es  <- rep(NA, n)
+  
+  wariancja <- numeric(n)
+  
+  wariancja[1:okno] <- var(zwroty[1:okno], na.rm = TRUE)
+  
+  for(t in 2:n) {
+    wariancja[t] <- lambda * wariancja[t-1] + (1 - lambda) * zwroty[t-1]^2
+  }
+  sigma <- sqrt(wariancja)
+  
+  start_petli <- okno + 1
+  
+  for(t in start_petli:n) {
+    
+    hist_zwroty <- zwroty[(t-okno):(t-1)]
+    hist_sigma  <- sigma[(t-okno):(t-1)]
+    sigma_dzis  <- sigma[t]
+    
+    zwroty_scaled <- hist_zwroty * (sigma_dzis / hist_sigma)
+    
+    res <- oblicz_pojedynczy_dzien(zwroty_scaled, alfa)
+    
+    wynik_var[t] <- res["VaR"]
+    wynik_es[t]  <- res["ES"]
+  }
+  
+  return(data.frame(VaR_New_EWMA = wynik_var, ES_New_EWMA = wynik_es))
+}
+```
+
+**Uruchomienie**
+
+```{r message=FALSE, warning=FALSE}
+wyniki_ewma_new <- oblicz_ewma_nowa(df_clean$Zwrot)
+
+df_clean$VaR_New_EWMA <- wyniki_ewma_new$VaR_New_EWMA
+df_clean$ES_New_EWMA  <- wyniki_ewma_new$ES_New_EWMA
+
+
+ggplot(df_clean, aes(x = Data)) +
+  geom_line(aes(y = Zwrot), color = "gray") +
+  geom_line(aes(y = -VaR_New_EWMA), size=0.8) +
+  labs(title = "Metoda EWMA",
+       y = "-VaR / Zwrot") +
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  theme_minimal()
+
+
+ggplot(df_clean %>% filter(Data >= "2017-12-31" & Data <= "2023-12-31"), aes(x = Data)) +
+  geom_line(aes(y = Zwrot), color = "gray") +
+  geom_line(aes(y = -VaR_New_EWMA), size=0.8) +
+  labs(title = "Metoda EWMA",
+       y = "-VaR / Zwrot") +
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  theme_minimal()
+
+ggplot(df_clean, aes(x = Data)) +
+  geom_line(aes(y = Zwrot), color = "gray") +
+  geom_line(aes(y = -ES_New_EWMA), size=0.8) +
+  labs(title = "Metoda EWMA",
+       y = "-ES / Zwrot") +
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  theme_minimal()
+
+ggplot(df_clean %>% filter(Data >= "2017-12-31" & Data <= "2023-12-31"), aes(x = Data)) +
+  geom_line(aes(y = Zwrot), color = "gray") +
+  geom_line(aes(y = -ES_New_EWMA), size=0.8) +
+  labs(title = "Metoda EWMA",
+       y = "-ES / Zwrot") +
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  theme_minimal()
+```
+
+**Obserwacje**
+
+-   Wykorzystanie empirycznego rozkładu stóp zwrotu prowadzi do wyższych estymacji wartości VaR, szczególnie w okresach podwyższonej zmienności rynkowej. Efekt ten jest najbardziej widoczny w fazach gwałtownych zaburzeń rynkowych, takich jak okres pandemii COVID-19 oraz epizody zwiększonej niepewności związanej z napięciami handlowymi między USA a Chinami.
+
+-   W okresach relatywnie niskiej zmienności rynkowej estymacje VaR pozostają stabilne i wykazują mniejszą dynamikę zmian.
+
+-   Model EWMA charakteryzuje się wysoką responsywnością na zmiany warunków rynkowych, dzięki czemu skutecznie odzwierciedla bieżący poziom ryzyka poprzez szybkie dostosowanie wariancji do aktualnych obserwacji.
+
+# Walidacja Modelu (Backtesting)
+
+Proces walidacji (backtesting) oparto na trzech niezależnych filarach:
+
+1.  **Test Kupca (POF):** Weryfikacja poprawności statystycznej liczby przekroczeń VaR.
+
+2.  **Test Christoffersena:** Analiza niezależności wyjątków w czasie, pozwalająca wykryć niebezpieczne zjawisko klastrowania strat.
+
+3.  **Test Świateł (Traffic Light Test):** Klasyfikacja modelu zgodnie ze standardami regulacyjnymi do strefy zielonej, żółtej lub czerwonej”.
+
+## Test Kupca
+
+Test ten weryfikuje hipotezę zerową $H_0: p = \alpha$, gdzie $p$ to rzeczywisty odsetek przekroczeń. Statystyka testowa opiera się na ilorazie wiarogodności i ma rozkład $\chi^2(1)$. Jeśli wartość p (p-value) testu jest mniejsza niż 0.05, odrzucamy model jako wadliwy.
+
+-   $H_0: \hat{p} = p$ (Model jest poprawny: liczba wyjątków jest zgodna z oczekiwaniami).
+-   $H_1: \hat{p} \neq p$ (Model jest błędny: liczba wyjątków jest istotnie różna).
+
+$$LR_{POF} = -2 \ln \left( \frac{(1-p)^{N-x} p^x}{(1-\hat{p})^{N-x} \hat{p}^x} \right)$$
+
+gdzie:
+
+$x$ – liczba dni, w których wystąpiło przekroczenie VaR (wyjątek),
+
+$N$ – całkowita liczba dni w badanym okresie.
+
+**Logika obliczeniowa**
+
+```{r}
+oblicz_kupca_pojedynczy <- function(zwroty_okno, var_okno, alfa) {
+  
+  dobre_dane <- !is.na(zwroty_okno) & !is.na(var_okno)
+  z_clean <- zwroty_okno[dobre_dane]
+  v_clean <- var_okno[dobre_dane]
+  
+  liczba_obserwacji <- length(z_clean)
+  
+  liczba_przekroczen <- sum(z_clean < -v_clean)
+  
+  p_teoretyczne <- 1 - alfa
+  p_empiryczne  <- liczba_przekroczen / liczba_obserwacji
+  
+  if (liczba_przekroczen == 0 || liczba_przekroczen == liczba_obserwacji) {
+    statystyka_LR <- 0
+  } else {
+    log_L0 <- liczba_przekroczen * log(p_teoretyczne) + 
+              (liczba_obserwacji - liczba_przekroczen) * log(1 - p_teoretyczne)
+    
+    log_LA <- liczba_przekroczen * log(p_empiryczne) + 
+              (liczba_obserwacji - liczba_przekroczen) * log(1 - p_empiryczne)
+    
+    statystyka_LR <- 2 * (log_LA - log_L0)
+  }
+  
+  p_wartosc <- 1 - pchisq(statystyka_LR, df = 1)
+  
+  return(p_wartosc)
+}
+
+test_kupca <- function(df, col_zwrot, col_var, nazwa_modelu, wielkosc_bloku = 500, alfa = 0.99) {
+  
+  wektor_zwrot <- df[[col_zwrot]]
+  wektor_var   <- df[[col_var]]
+  liczba_wierszy <- length(wektor_zwrot)
+  
+  wyniki_p <- rollapply(
+    data = 1:liczba_wierszy, 
+    width = wielkosc_bloku, 
+    FUN = function(indeks) {
+      oblicz_kupca_pojedynczy(wektor_zwrot[indeks], wektor_var[indeks], alfa)
+    }, 
+    fill = NA, 
+    align = "right"
+  )
+  
+  zakres <- wielkosc_bloku:liczba_wierszy
+  
+  wynik <- data.frame(
+    Data = df$Data[zakres],
+    Model = nazwa_modelu,
+    Zwrot = wektor_zwrot[zakres],
+    VaR = wektor_var[zakres],
+    P_Wartosc = wyniki_p[zakres]
+  ) %>%
+    mutate(Decyzja = ifelse(P_Wartosc < 0.05, "ODRZUCIĆ", "PRZYJĄĆ"))
+  
+  return(wynik)
+}
+
+res_hist_new <- test_kupca(df_clean, "Zwrot", "VaR_New_Hist", "Hist_New")
+res_ewma_new <- test_kupca(df_clean, "Zwrot", "VaR_New_EWMA", "EWMA (nowe)")
+
+finalna_tabela <- rbind( res_hist_new, res_ewma_new)
+```
+
+**Rysowanie wykresu**
+
+```{r warning=FALSE}
+nazwa_stara_metoda <- "Hist_Old"  
+nazwa_nowa_metoda  <- "Hist_New"  
+p_val_stara <- finalna_tabela %>%
+  filter(Model == nazwa_stara_metoda) %>%
+  select(Data, p_stara = P_Wartosc) 
+
+p_val_nowa <- finalna_tabela %>%
+  filter(Model == nazwa_nowa_metoda) %>%
+  select(Data, p_nowa = P_Wartosc) 
+
+df_plot <- df_clean %>%
+  left_join(p_val_stara, by = "Data") %>%
+  left_join(p_val_nowa, by = "Data")
+
+ggplot(df_plot, aes(x = Data)) +
+
+  geom_tile(data = subset(df_plot, p_stara < 0.05),
+            aes(y = 0, height = Inf, fill = "Odrzucenie Stara"),
+            alpha = 0.3) + 
+  
+  geom_tile(data = subset(df_plot, p_nowa < 0.05),
+            aes(y = 0, height = Inf, fill = "Odrzucenie Nowa"),
+            alpha = 0.3) +
+  
+  geom_line(aes(y = Zwrot), color = "darkgray", alpha = 0.6) +
+
+  geom_line(aes(y = -VaR_New_Hist), size = 0.8) +
+  
+  
+  geom_point(data = subset(df_plot, Zwrot < -VaR_New_Hist),
+             aes(y = Zwrot), 
+             color = "blue", size = 2) +
+  
+  
+  scale_fill_manual(name = "Test Kupca (p<0.05)",
+                    values = c("Odrzucenie Nowa" = "blue",
+                               "Odrzucenie Stara" = "red")) +
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  
+  theme_minimal() +
+  labs(title = "Metoda Historyczna: -VaR vs Zwrot",
+       subtitle = "Kolorowe tło oznacza odrzucenie modelu (fioletowy = oba odrzucone)",
+       y = "Wartość", x = "Data")
+```
+
+**Obserwacje - Metoda historyczna**
+
+-   Metoda ta w okresie wybuchu wojny na Ukrainie w obu wersjach nie poradziła sobie z wyznaczeniem VaR. Ten okres charakteryzuje się dłuższym okresem zwiększonych wahań. Dla naszych danych metoda historyczna została odrzucona, zarówno przed, jak i po korekcie liczenia.
+
+```{r message=FALSE, warning=FALSE}
+nazwa_nowa_metoda  <- "EWMA (nowe)"  
+
+
+p_val_nowa <- finalna_tabela %>%
+  filter(Model == nazwa_nowa_metoda) %>%
+  select(Data, p_nowa = P_Wartosc) 
+
+df_plot_ewma <- df_clean %>%
+  left_join(p_val_stara, by = "Data") %>%
+  left_join(p_val_nowa, by = "Data")
+
+ggplot(df_plot_ewma, aes(x = Data)) +
+
+
+  geom_tile(data = subset(df_plot_ewma, p_nowa < 0.05),
+            aes(y = 0, height = Inf, fill = "Odrzucenie"),
+            alpha = 0.3) +
+  
+  geom_line(aes(y = Zwrot), color = "darkgray", alpha = 0.6) +
+
+  geom_line(aes(y = -VaR_New_EWMA), size = 0.8) +
+
+  geom_point(data = subset(df_plot_ewma, Zwrot < -VaR_New_EWMA),
+             aes(y = Zwrot), 
+             color = "blue", size = 2) +
+
+  scale_x_date(date_breaks = "12 months", date_labels = "%Y") +
+  theme_minimal() +
+  labs(title = "Metoda EWMA: -VaR vs Zwrot",
+       subtitle = "Kolorowe tło oznacza odrzucenie modelu (fioletowy = oba odrzucone)",
+       y = "Wartość", x = "Data")
+```
+
+**Obserwacje - Metoda EWMA**
+
+-   Metoda ta okazała się bardzo skuteczna w każdych warunkach, w których miała w pamięci jakieś większe wahania.
+
+```{r}
+podsumowanie_kupca <- finalna_tabela %>%
+  group_by(Model) %>%
+  summarise(
+    Liczba_Dni_Testu = n(),
+    
+    Dni_Odrzucenia = sum(P_Wartosc < 0.05, na.rm = TRUE),
+    
+    Procent_Odrzucen = round(mean(P_Wartosc < 0.05, na.rm = TRUE) * 100, 2),
+  ) %>%
+  arrange(Procent_Odrzucen)
+
+kable(podsumowanie_kupca, 
+      caption = "Podsumowanie Testu Kupca (Okno Przesuwne)",
+      col.names = c("Model", "Dni Testu", "Dni Odrzucenia H0", 
+                    "% Odrzuceń"))
+```
+
+**Wnioski**
+
+-   Wyniki testu Kupca wskazują na istotną poprawę jakości estymacji ryzyka w modelu EWMA. Zaobserwowano znaczące ograniczenie liczby odrzuceń hipotezy o poprawnym pokryciu VaR, co świadczy o lepszym dopasowaniu modelu do rzeczywistego rozkładu strat.
+
+-   Model EWMA skutecznie reaguje na zmieniające się warunki rynkowe, w szczególności w okresach podwyższonej zmienności, co przekłada się na bardziej wiarygodne oszacowania ryzyka.
+
+-   W przypadku metody historycznej widoczne jest systematyczne niedoszacowanie wartości VaR, co negatywnie wpływa na wyniki backtestingu. Ograniczona zdolność tej metody do szybkiej adaptacji do gwałtownych zmian rynkowych pozostaje jej kluczowym ograniczeniem.
+
+## Test Niezależności (Christoffersena)
+
+Sam test Kupca jest niewystarczający, ponieważ sprawdza jedynie łączną liczbę przekroczeń, ignorując ich rozkład w czasie. Dla instytucji finansowej równie ważne jest, aby straty nie występowały w seriach (klastrach), gdyż może to zagrozić jej płynności.
+
+Test Christoffersona weryfikuje hipotezę o niezależności przekroczeń. Bada on, czy wystąpienie wyjątku w dniu dzisiejszym zwiększa prawdopodobieństwo wystąpienia wyjątku jutro.
+
+$$LR = -2 \ln[(1-\pi)^{n_{00}+n_{10}}\pi^{n_{01}+n_{11}}] + 2 \ln[(1-\pi_{01})^{n_{00}}\pi_{01}^{n_{01}}(1-\pi_{11})^{n_{10}}\pi_{11}^{n_{11}}]$$
+
+$n_{00}$: brak wyjątku $\to$ brak wyjątku
+
+$n_{01}$: brak wyjątku $\to$ wyjątek
+
+$n_{10}$: wyjątek $\to$ brak wyjątku
+
+$n_{11}$: wyjątek $\to$ wyjątek
+
+$\Pi_{01} = \frac{n_{01}}{n_{00} + n_{01}}$
+
+$\Pi_{11} = \frac{n_{11}}{n_{10} + n_{11}}$
+
+$\Pi = \frac{n_{01} + n_{11}}{n_{00} + n_{01} + n_{10} + n_{11}}$
+
+**Logika obliczeniowa**
+
+```{r Logika obliczeniowa, warning=FALSE}
+oblicz_statystyke_christoffersena <- function(hits) {
+  n <- length(hits)
+  n00 <- 0; n01 <- 0; n10 <- 0; n11 <- 0
+  
+  for(i in 2:n) {
+    prev <- hits[i-1]
+    curr <- hits[i]
+    
+    if(prev == 0 && curr == 0) n00 <- n00 + 1
+    if(prev == 0 && curr == 1) n01 <- n01 + 1 
+    if(prev == 1 && curr == 0) n10 <- n10 + 1
+    if(prev == 1 && curr == 1) n11 <- n11 + 1 
+  }
+  
+  if ((n01 + n11) == 0) {
+    return(list(LR_ind = 0, P_val = 1, Note = "Brak wyjątków", n11 = 0, n01 = 0))
+  }
+  
+  if ((n10 + n11) == 0) {
+     return(list(LR_ind = 0, P_val = 1, Note = "Brak ciągłości po wyjątku", n11 = n11, n01 = n01))
+  }
+  
+  pi_01 <- n01 / (n00 + n01) 
+  pi_11 <- n11 / (n10 + n11) 
+  pi    <- (n01 + n11) / (n00 + n01 + n10 + n11) 
+  
+  log_safe <- function(n, p) {
+    if (n == 0 || p == 0) return(0)
+    return(n * log(p))
+  }
+  
+  ln_L0 <- log_safe(n00 + n10, 1 - pi) + log_safe(n01 + n11, pi)
+  ln_LA <- log_safe(n00, 1 - pi_01) + log_safe(n01, pi_01) + 
+           log_safe(n10, 1 - pi_11) + log_safe(n11, pi_11)
+  
+  lr_ind <- 2 * (ln_LA - ln_L0)
+  p_val <- 1 - pchisq(lr_ind, df = 1)
+  
+  return(list(LR_ind = lr_ind, P_val = p_val, Note = "OK", n11 = n11, n01 = n01))
+}
+
+test_christoffersena <- function(df, col_zwrot, col_var, nazwa_modelu, rozmiar_okna = 500) {
+  
+  dane <- df %>% 
+    filter(!is.na(.data[[col_var]])) %>%
+    select(Data, Zwrot = .data[[col_zwrot]], VaR = .data[[col_var]])
+  
+  n <- nrow(dane)
+  
+  if(n < rozmiar_okna) return(NULL)
+  
+  przekroczenia <- ifelse(dane$Zwrot < -dane$VaR, 1, 0)
+  
+  wyniki_data <- dane$Data[rozmiar_okna:n]
+  wyniki_pval <- numeric(length(wyniki_data))
+  wyniki_n11  <- numeric(length(wyniki_data))
+  wyniki_n_wszystkie <- numeric(length(wyniki_data))
+  
+  for(i in rozmiar_okna:n) {
+    
+    start_idx <- i - rozmiar_okna + 1
+    przekroczenia_okna <- przekroczenia[start_idx:i]
+    
+    res <- oblicz_statystyke_christoffersena(przekroczenia_okna)
+    
+    idx_wynik <- i - rozmiar_okna + 1
+    wyniki_pval[idx_wynik] <- res$P_val
+    wyniki_n11[idx_wynik]  <- res$n11
+    wyniki_n_wszystkie[idx_wynik] <- sum(przekroczenia_okna)
+  }
+  
+  wynikowa_tabela <- data.frame(
+    Data = wyniki_data,
+    Model = nazwa_modelu,
+    P_Wartosc = wyniki_pval,
+    Liczba_wyjatkow = wyniki_n_wszystkie,
+    Liczba_Klastrow_n11 = wyniki_n11
+  )
+  
+  return(wynikowa_tabela)
+}
+
+
+res_ind_hist_new <- test_christoffersena(df_clean, "Zwrot", "VaR_New_Hist", "Hist_New" )
+
+res_ind_ewma_new <- test_christoffersena(df_clean, "Zwrot", "VaR_New_EWMA", "EWMA_New" )
+
+finalna_tabela_christoffersen <- rbind(
+  res_ind_hist_new, 
+  res_ind_ewma_new
+)
+```
+
+**Wykresy**
+
+```{r Wykres1, message=FALSE, warning=FALSE}
+rysuj_zlozony_wykres_final <- function(dane_long, tytul_wykresu) {
+
+  label_klastry <- "1. Klastry (n11)"
+  label_suma    <- "2. Suma Wyjątków"
+  label_pval    <- "3. P-value"
+  
+  # Przygotowanie danych do formatu długiego pod wykresy
+  df_plot_ready <- dane_long %>%
+    select(Data, Liczba_Klastrow_n11, Liczba_wyjatkow, P_Wartosc) %>%
+    pivot_longer(cols = -Data, names_to = "Typ_Miernika", values_to = "Wartosc") %>%
+    mutate(Typ_Wykresu = case_when(
+      Typ_Miernika == "Liczba_Klastrow_n11" ~ label_klastry,
+      Typ_Miernika == "Liczba_wyjatkow"      ~ label_suma,
+      Typ_Miernika == "P_Wartosc"            ~ label_pval
+    ))
+
+  # Ramka danych dla linii krytycznej p=0.05
+  df_linie <- data.frame(
+    Typ_Wykresu = label_pval,
+    Poziom_Linii = 0.05
+  )
+
+  ggplot(df_plot_ready, aes(x = Data, y = Wartosc)) +
+    geom_tile(data = subset(df_plot_ready, Typ_Wykresu == label_pval & Wartosc < 0.05), 
+              aes(y = 0.5, height = Inf, fill = "Odrzucenie modelu (p < 0.05)"), 
+              alpha = 0.2) +
+    
+    # Linia danych
+    geom_line(color = "midnightblue", size = 0.7) +
+    
+    geom_hline(data = df_linie, aes(yintercept = Poziom_Linii), 
+               linetype = "dashed", color = "firebrick", size = 0.8) +
+    
+    facet_wrap(~Typ_Wykresu, ncol = 1, scales = "free_y") +
+    
+    scale_y_continuous(n.breaks = 5) +
+    scale_fill_manual(name = "", values = c("Odrzucenie modelu (p < 0.05)" = "red")) +
+    theme_minimal() +
+    theme(
+      strip.text = element_text(size = 11, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = tytul_wykresu,
+      subtitle = "Analiza stabilności i niezależności wyjątków VaR",
+      y = "Wartość",
+      x = "Data"
+    )
+}
+
+# Wykres dla Metody Historycznej
+dane_hist_chris <- finalna_tabela_christoffersen %>% filter(Model == "Hist_New")
+print(rysuj_zlozony_wykres_final(dane_hist_chris, "Walidacja Modelu: Symulacja Historyczna"))
+
+# Wykres dla Metody EWMA
+dane_ewma_chris <- finalna_tabela_christoffersen %>% filter(Model == "EWMA_New")
+print(rysuj_zlozony_wykres_final(dane_ewma_chris, "Walidacja Modelu: EWMA z rozkładem empirycznym"))
+```
+
+**Wnioski**
+
+-   Wyniki testu Christoffersena dla metody historycznej wskazują na istotne naruszenia założenia niezależności przekroczeń VaR. Zjawisko klastrowania wyjątków jest szczególnie widoczne w okresach podwyższonej zmienności rynkowej, takich jak okres po wybuchu pandemii COVID-19 oraz epizody zwiększonej niepewności związanej z napięciami handlowymi między USA a Chinami. Oznacza to ograniczoną zdolność tej metody do adekwatnego modelowania ryzyka w warunkach dynamicznych zmian rynkowych.
+
+-   Model EWMA wykazuje wysoką skuteczność w zakresie spełniania założenia niezależności przekroczeń. Wyjątki mają charakter rozproszony i nie wykazują istotnego klastrowania w większości analizowanego okresu, co potwierdza poprawne modelowanie zmienności warunkowej.
+
+-   Sporadyczne odrzucenia testu występują jedynie w krótkotrwałych okresach ekstremalnych zaburzeń rynkowych, co sugeruje, że obserwowane przekroczenia mają charakter incydentalny, a nie systemowy.
+
+# Budowa portfela inwestycyjnego
+
+**W drugiej części projektu celem jest wyznaczenie ryzyka rynkowego (miar VaR oraz ES) dla zdywersyfikowanego portfela inwestycyjnego, składającego się z indeksów giełdowych z trzech różnych kontynentów: DAX (Niemcy), Nikkei 225 (Japonia) oraz S&P 500 (USA).**
+
+**Zastosowana metoda opiera się na założeniu, że stopy zwrotu z aktywów (oraz całego portfela) mają rozkład normalny. Kluczowym wyzwaniem w budowie tego modelu jest uwzględnienie zmienności rynkowej, która nie jest stała w czasie.**
+
+**Analiza obejmuje okres od 2018 do 2025 roku. Ze względu na różnice w kalendarzach świąt państwowych w Niemczech, Japonii i USA, dane zostały zsynchronizowane metodą Last Observation Carried Forward (LOCF), aby zachować ciągłość notowań dla całego portfela. Jakość otrzymanego modelu VaR zostanie zweryfikowana za pomocą testów wstecznych (testu Świateł oraz testu niezależności Christoffersena).**
+
+## Przygototwanie danych
+
+```{r Wczytanie danych, warning=FALSE}
+dax <- read_csv("^dax_d.csv", show_col_types = FALSE) %>% select(Data, Zamkniecie) %>% rename(DAX = Zamkniecie)
+nkx <- read_csv("^nkx_d.csv", show_col_types = FALSE) %>% select(Data, Zamkniecie) %>% rename(Nikkei = Zamkniecie)
+spx <- read_csv("^spx_d2.csv", show_col_types = FALSE) %>% select(Data, Zamkniecie) %>% rename(SP500 = Zamkniecie)
+```
+
+**Połączenie danych w jedną tabelę**
+
+Użyta została funkcja `locf()`, która uzupełnia wszelkie braki wynikające z różnych dni otwarcia giełdy. Funkcja ta zamienia braki na ostatnie poprzedzające wartości, w związku z tym zachowujemy rzeczywistą dynamikę rynku, czyli w dniu nieaktywnym cena zostaje ta sama. Ta metoda filtrowania działa poprawnie od pierwszego pełnego dnia (dnia kiedy wszystkie rynki były otwarte), w związku z czym w naszym przypadku tracimy pierwsze dwa dni obserwacji.
+
+```{r}
+dane_polaczone <- dax %>%
+  full_join(nkx, by = "Data") %>%
+  full_join(spx, by = "Data") %>%
+  arrange(Data)
+
+dane_pelne <- dane_polaczone %>%
+  do(na.locf(.)) %>% 
+  na.omit()
+```
+
+**Obliczenie stóp zwrotu**
+
+```{r}
+stopy <- dane_pelne %>%
+  mutate(
+    r_DAX = c(NA, diff(log(DAX))),
+    r_Nikkei = c(NA, diff(log(Nikkei))),
+    r_SP500 = c(NA, diff(log(SP500)))
+  ) %>%
+  drop_na()
+```
+
+```{r}
+wagi <- c(1/3, 1/3, 1/3)
+zwroty_portfela <- (wagi[1] * stopy$r_DAX) + 
+                   (wagi[2] * stopy$r_Nikkei) + 
+                   (wagi[3] * stopy$r_SP500)
+```
+
+## Korelacja poszczególnych indeksów
+
+**Obliczenie korelacji między indeksami** $$\rho = \frac{cov_t(x,y)} {\sqrt{\sigma_{x,t} \cdot \sigma_{y,t}}}$$
+
+```{r}
+oblicz_korelacje_ewma <- function(x, y, lambda = 0.94) {
+  n <- length(x)
+  
+  var_x <- numeric(n)
+  var_y <- numeric(n)
+  cov_xy <- numeric(n)
+  
+  var_x[1] <- var(x, na.rm = TRUE)
+  var_y[1] <- var(y, na.rm = TRUE)
+  cov_xy[1] <- cov(x, y)
+  
+  for(t in 2:n) {
+    var_x[t]  <- lambda * var_x[t-1]  + (1 - lambda) * x[t]^2
+    var_y[t]  <- lambda * var_y[t-1]  + (1 - lambda) * y[t]^2
+    cov_xy[t] <- lambda * cov_xy[t-1] + (1 - lambda) * x[t] * y[t]
+  }
+  
+  rho <- cov_xy / (sqrt(var_x) * sqrt(var_y))
+  return(rho)
+}
+
+stopy$rho_DAX_Nikkei   <- oblicz_korelacje_ewma(stopy$r_DAX, stopy$r_Nikkei)
+stopy$rho_DAX_SP500    <- oblicz_korelacje_ewma(stopy$r_DAX, stopy$r_SP500)
+stopy$rho_Nikkei_SP500 <- oblicz_korelacje_ewma(stopy$r_Nikkei, stopy$r_SP500)
+```
+
+**Wykres**
+
+```{r Wizualizacja}
+dane_wykres_corr <- stopy %>%
+  select(Data, rho_DAX_Nikkei, rho_DAX_SP500, rho_Nikkei_SP500) %>%
+  pivot_longer(cols = -Data, names_to = "Para", values_to = "Korelacja") %>%
+  mutate(Para = recode(Para, 
+                       "rho_DAX_Nikkei" = "DAX vs Nikkei",
+                       "rho_DAX_SP500" = "DAX vs S&P500",
+                       "rho_Nikkei_SP500" = "Nikkei vs S&P500"))
+
+ggplot(dane_wykres_corr, aes(x = Data, y = Korelacja, color = Para)) +
+  geom_line(size = 0.8, alpha = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") + 
+  facet_wrap(~Para, ncol = 1) + 
+  labs(title = "Dynamiczna korelacja między rynkami",
+       y = "Współczynnik korelacji",
+       x = "Data") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.position = "none")
+```
+
+**Obserwacje**
+
+-   Korelacje między rynkami są stosunkowo wysokie w okresach globalnego stresu i niepewności, takich jak kryzysy finansowe, pandemia COVID-19. W takich momentach inwestorzy reagują podobnie na całym świecie, co powoduje synchronizację i ogranicza korzyści z dywersyfikacji.
+
+-   Z kolei korelacje są niskie w okresach stabilnych, gdy dominują lokalne czynniki makroekonomiczne, Wtedy rynki poruszają się bardziej niezależnie, a dywersyfikacja geograficzna działa najefektywniej.
+
+## Tworzenie portfela
+
+Kolejne kroki w wyznaczaniu VaR oraz ES portfela:
+
+Estymowanie wariancji pojedynczych indeksów: $\sigma_t^2 = \lambda \sigma_{t-1}^2 + (1-\lambda) r_{t-1}^2$ - przyjęto $\lambda = 0.94$
+
+Wyliczenie kowariancji między parami indeksów:$$cov(x,y) = \lambda \cdot cov_{n-1}(x,y) + (1-\lambda) \cdot r_i \cdot r_j$$
+
+Wyznaczenie wariancji portfela `var_P` , ponieważ ryzyko portfela wynika nie tylko z ryzyka poszczególnych składników, ale też z ich wzajemnych korelacji: $$\sigma_{P, t}^2 = \sum_{i=1}^3 w_i^2 \sigma_{i, t}^2 + 2 \sum_{i < j} w_i w_j cov_{ij, t}$$
+
+Finalnie wyznaczenie VaR oraz ES:\
+$$VaR = z_{0.99} \cdot \sigma_p$$
+
+$$ES = \sigma_p \cdot \frac{\phi(z_{0.99})}{1-0.99}$$
+
+```{r Liczenie VaR oraz ES portfela}
+oblicz_portfel <- function(stopy_df, wagi, lambda = 0.94, alfa = 0.99, okno = 500){
+
+  R <- as.matrix(stopy_df[, c("r_DAX", "r_Nikkei", "r_SP500")])
+  n_dni <- nrow(R)
+
+  sigma_portfela <- rep(NA, n_dni)
+  VaR_model <- rep(NA, n_dni)
+  ES_model  <- rep(NA, n_dni)
+
+  w1 <- wagi[1]; w2 <- wagi[2]; w3 <- wagi[3]
+
+  z_score  <- qnorm(alfa)
+  es_factor <- dnorm(z_score) / (1 - alfa)
+
+  for (t in (okno + 1):n_dni) {
+
+    indeks_start <- t - okno
+    indeks_koniec   <- t - 1
+
+    var1 <- var(R[indeks_start:indeks_koniec,1])
+    var2 <- var(R[indeks_start:indeks_koniec,2])
+    var3 <- var(R[indeks_start:indeks_koniec,3])
+
+    cov12 <- cov(R[indeks_start:indeks_koniec,1], R[indeks_start:indeks_koniec,2])
+    cov13 <- cov(R[indeks_start:indeks_koniec,1], R[indeks_start:indeks_koniec,3])
+    cov23 <- cov(R[indeks_start:indeks_koniec,2], R[indeks_start:indeks_koniec,3])
+
+    for (i in (indeks_start + 1):indeks_koniec) {
+
+      r1 <- R[i,1]; r2 <- R[i,2]; r3 <- R[i,3]
+
+      var1 <- lambda * var1 + (1 - lambda) * r1^2
+      var2 <- lambda * var2 + (1 - lambda) * r2^2
+      var3 <- lambda * var3 + (1 - lambda) * r3^2
+
+      cov12 <- lambda * cov12 + (1 - lambda) * r1 * r2
+      cov13 <- lambda * cov13 + (1 - lambda) * r1 * r3
+      cov23 <- lambda * cov23 + (1 - lambda) * r2 * r3
+    }
+
+    var_P <- (w1^2 * var1) + (w2^2 * var2) + (w3^2 * var3) +
+             (2 * w1 * w2 * cov12) +
+             (2 * w1 * w3 * cov13) +
+             (2 * w2 * w3 * cov23)
+
+    sigma_portfela[t] <- sqrt(var_P)
+
+    VaR_model[t] <- z_score * sigma_portfela[t]
+    ES_model[t]  <- sigma_portfela[t] * es_factor
+  }
+
+  return(data.frame(
+    Data = stopy_df$Data,
+    Sigma_P = sigma_portfela,
+    VaR = VaR_model,
+    ES = ES_model
+  ))
+}
+```
+
+**Połączenie portfela w całość**
+
+```{r Połączenie wszystkiego - utworzenie portfela}
+testtttt <- oblicz_portfel(stopy, wagi)
+wyniki_model <- oblicz_portfel(stopy, wagi)
+wyniki_model$Zwrot <- zwroty_portfela
+
+```
+
+## Wizualizacja VaR oraz ES
+
+```{r WYkres2, warning=FALSE}
+ggplot(wyniki_model, aes(x = Data)) +
+  geom_line(aes(y = Zwrot), color = "gray", alpha = 0.7) +
+  geom_line(aes(y = -VaR, color = "VaR"), size = 0.8) +
+  geom_line(aes(y = -ES, color = "ES"), size = 0.8, linetype = "dashed") +
+  labs(title = "VaR i ES Portfela: Metoda Budowy Modeli (Kowariancja EWMA)",
+       subtitle = "Założenie: Rozkład Normalny",
+       y = "Zwrot / Ryzyko") +
+  theme_minimal() +
+  scale_color_manual(values = c("VaR" = "red", "ES" = "blue"))
+```
+
+## Test Niezależności (Christoffersena)
+
+```{r warning=FALSE}
+test_chris_portfel <- test_christoffersena(wyniki_model, "Zwrot", "VaR", "Model_portfela")
+
+rysuj_pojedynczy_wykres <- function(dane, tytul_wykresu) {
+  
+  label_klastry <- "1. Klastry (n11)"
+  label_suma    <- "2. Suma Wyjątków"
+  label_pval    <- "3. P-value"
+
+  df_n11 <- dane %>%
+    select(Data, Wartosc = Liczba_Klastrow_n11) %>%
+    mutate(Typ_Wykresu = label_klastry)
+  
+  df_all <- dane %>%
+    select(Data, Wartosc = Liczba_wyjatkow) %>%
+    mutate(Typ_Wykresu = label_suma)
+  
+  df_pval <- dane %>%
+    select(Data, Wartosc = P_Wartosc) %>%
+    mutate(Typ_Wykresu = label_pval)
+  
+  df_plot_ready <- bind_rows(df_n11, df_all, df_pval)
+  
+  df_linie <- data.frame(
+    Typ_Wykresu = label_pval,
+    Poziom_Linii = 0.05
+  )
+  
+  ggplot(df_plot_ready, aes(x = Data)) +
+    
+    geom_tile(data = df_pval %>% filter(Wartosc < 0.05), 
+              aes(y = 0.5, height = Inf, fill = "Odrzucenie (p<0.05)"), alpha = 0.3) +
+    geom_line(aes(y = Wartosc), color = "blue", size = 0.8) +
+    geom_hline(data = df_linie, aes(yintercept = Poziom_Linii), 
+               linetype = "dashed", color = "red", size = 1) +
+    facet_wrap(~Typ_Wykresu, ncol = 1, scales = "free_y") +
+    scale_y_continuous(n.breaks = 4) + 
+    scale_fill_manual(name = "", 
+                      values = c("Odrzucenie (p<0.05)" = "red")) +
+    
+    theme_minimal() +
+    theme(strip.text = element_text(size = 10, face = "bold"),
+          legend.position = "bottom") + 
+    labs(
+      title = tytul_wykresu,
+      y = "Wartość",
+      x = "Data"
+    )
+}
+
+rysuj_pojedynczy_wykres(test_chris_portfel, "Wyniki testu Christoffersena")
+```
+
+**Obserwacje**
+
+-   Liczba zarejestrowanych klastrów od połowy 2024. roku z wcześniej obserwowanego maksymalnie 1 klastra w badanym oknie do 3 a nawet 5 w roku 2025. Jest to okres poprzedzony spokojem rynkowym od początku 2023. do widocznego na wykresach wzrostu w ogólnej liczbie wyjątków oraz klastrów.
+
+-   Model zawiódł wtedy, ponieważ liczony VaR bazował na oknach spokojnych zmian (połowa roku 2023.-połowa roku 2024.). Dlatego nagłe krótkie okresy większych wahań stóp zwrotu sprawiły, że liczba wyjątków znacząco wzrosła. Idąc razem z tym wzrosła też liczba serii tych wystąpień.
+
+## Test świateł
+
+Korzystając z rozkładu dwumianowego (bernoulliego) wyznaczam skumulowane prawdopodobieństwo i porównuję z tabelą zawartą w wykładzie.
+
+Prawdopodobieństwo wystąpienia dokładnie $k$ przekroczeń wyliczamy ze wzoru: $$P(X = k) = \binom{n}{k} p^k (1-p)^{n-k}$$
+
+```{r}
+n <- 500
+p <- 0.01
+k_values <- 0:20
+
+tabela_prawdopodobienstw <- data.frame(
+  Liczba_wyjatkow_k = k_values,
+  P_skumulowane = pbinom(k_values, size = n, prob = p)
+)
+
+tabela_prawdopodobienstw$P_skumulowane <- round(tabela_prawdopodobienstw$P_skumulowane, 4)
+
+kable(tabela_prawdopodobienstw, 
+      col.names = c("Liczba wyjątków (k)", "P(X <= k) [%]"),
+      caption = "Rozkład prawdopodobieństwa liczby wyjątków dla n=500 i p=0.01")
+```
+
+**Patrząc na skumulowane prawdopodobieństwo decyduję się na ustalenie granicy strefy zielonej na 8 wyjątków, a strefy żółtej na 14.**
+
+**Funkcja do liczenia testu**
+
+```{r Funkcja testu}
+test_swiatel <- function(df, col_zwrot, col_var, nazwa_modelu, rozmiar_okna = 500){
+  dane <- df %>% 
+  filter(!is.na(.data[[col_var]])) %>%
+  select(Data, Zwrot = .data[[col_zwrot]], VaR = .data[[col_var]])
+  
+  n <- nrow(dane)
+  if(n < rozmiar_okna) return(NULL)
+  
+  przekroczenia <- ifelse(dane$Zwrot < -dane$VaR, 1, 0)
+
+  suma_wyjatkow <- rollapply(przekroczenia, width = rozmiar_okna, FUN = sum, 
+                             fill = NA, align = "right")
+  
+
+  strefa <- case_when(
+    suma_wyjatkow <= 8 ~ "Zielona",
+    suma_wyjatkow <= 14 ~ "Żółta",
+    TRUE ~ "Czerwona"
+  )
+  
+  wynikowa_tabela <- data.frame(
+    Data = dane$Data,
+    Liczba_Wyjatkow = suma_wyjatkow,
+    Strefa = strefa
+  ) %>%
+    filter(!is.na(Liczba_Wyjatkow))
+  
+  return(wynikowa_tabela)
+}
+```
+
+**Wykres**
+
+```{r Wykres3}
+wyniki_testu_swiatel <- test_swiatel(wyniki_model, "Zwrot", "VaR", "EWMA")
+
+ggplot(wyniki_testu_swiatel, aes(x = Data, y = Liczba_Wyjatkow)) +
+  
+  geom_rect(aes(xmin = min(Data), xmax = max(Data), ymin = 0, ymax = 8.5),
+            fill = "green", alpha = 0.05) +
+  
+  geom_rect(aes(xmin = min(Data), xmax = max(Data), ymin = 8.5, ymax = 14.5),
+            fill = "gold", alpha = 0.1) +
+  
+  geom_rect(aes(xmin = min(Data), xmax = max(Data), ymin = 14.5, ymax = max(Liczba_Wyjatkow, 20)),
+            fill = "red", alpha = 0.05) +
+  
+  geom_line(size = 0.8, color = "black") +
+
+  labs(title = "Test Świateł",
+       subtitle = "Okno: 500 dni | Zielona: <=8, Żółta: 9-14, Czerwona: >14",
+       y = "Liczba wyjątków",
+       x = "Data") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+tabela_procentowa <- wyniki_testu_swiatel %>%
+  mutate(Strefa = factor(Strefa, levels = c("Zielona", "Żółta", "Czerwona"))) %>%
+  
+  count(Strefa, name = "Liczba_Dni") %>%
+  
+  mutate(
+    Procent = percent(Liczba_Dni / sum(Liczba_Dni), accuracy = 0.01) 
+  )
+
+kable(tabela_procentowa)
+```
+
+**Wnioski i obserwacje**
+
+-   Model przez większość okresu funkcjonuje w stanie podwyższonego ryzyka / obserwacji, bez trwałej stabilizacji ani jednoznacznego kryzysu.
+
+-   Stabilne warunki pełnej akcpetacji modelu są krótkotrwałe i epizodyczne.
+
+-   Podobnie jak przy wynikach testu Christoffersena zauważamy pogorszenie się modelu od mniej więcej połowy roku 2024., aż dla najświeższych danych pozostaje w strefie czerwonej. Bardzo mały udział strefy zielonej w całym okresie wskazuje na niemalże konieczną korektę.
